@@ -46,7 +46,12 @@ def offline_prefill_segment(
     store: Optional[OfflineKVCache] = None,
     extra_key: str = "",
 ) -> OfflineSegment:
-    """Run a chunked prefill on ``segment_text`` and stash the resulting KV.
+    """Prefill ``segment_text`` in one forward and stash the resulting KV.
+
+    Qwen3-32B loaded with ``device_map="auto"`` can leave ``DynamicCache``
+    layers uninitialized when the same cache is fed chunk by chunk. This path
+    runs the whole segment once and raises if any layer KV is missing.
+    ``chunk_size`` is kept for caller compatibility and is not used.
 
     Parameters
     ----------
@@ -59,8 +64,8 @@ def offline_prefill_segment(
     prepend_bos:
         Prepend BOS to the first segment (matches __REDKNOT_V02__ behaviour).
     chunk_size:
-        Sub-batch length used during the offline prefill to bound peak
-        hidden-state memory; KV is fully retained.
+        Retained for API compatibility. The NPU capture path ignores it and
+        prefills the whole segment in one forward.
     model_id:
         String identifier used by the global cache key. Defaults to the
         model's ``_name_or_path``.
@@ -82,23 +87,35 @@ def offline_prefill_segment(
         ids = torch.cat([bos, ids], dim=1)
     doc_len = int(ids.shape[1])
 
+    # NPU Qwen3-32B workaround: DynamicCache lazy init leaves cache layers
+    # uninitialized across multi-device auto sharding. Run a single forward
+    # over the whole segment with HF-native DynamicCache() (lazy DynamicLayer
+    # per layer), which reliably captures KV for all layers in eager mode.
+    # chunk_size is retained for callers and intentionally ignored here.
     past = DynamicCache()
-    for start in range(0, doc_len, chunk_size):
-        end = min(start + chunk_size, doc_len)
-        chunk = ids[:, start:end].to(model.device)
-        out = model(input_ids=chunk, past_key_values=past, use_cache=True)
-        past = out.past_key_values
-        del out
-
-    kv: List[Tuple[torch.Tensor, torch.Tensor]] = []
     n_layers = model.config.num_hidden_layers
-    for li in range(n_layers):
-        k = past.layers[li].keys.detach().clone()
-        v = past.layers[li].values.detach().clone()
-        kv.append((k, v))
+    out = model(
+        input_ids=ids.to(model.device), past_key_values=past, use_cache=True
+    )
+    if hasattr(torch, "npu"):
+        torch.npu.synchronize()
+    del out
+    missing = [
+        i
+        for i, layer in enumerate(past.layers)
+        if getattr(layer, "keys", None) is None
+    ]
+    if missing:
+        raise RuntimeError(f"KV capture missed layers: {missing}")
+    kv: List[Tuple[torch.Tensor, torch.Tensor]] = [
+        (layer.keys.detach().clone(), layer.values.detach().clone())
+        for layer in past.layers
+    ]
     del past
     gc.collect()
-    if torch.cuda.is_available():
+    if hasattr(torch, "npu"):
+        torch.npu.empty_cache()
+    elif torch.cuda.is_available():
         torch.cuda.empty_cache()
 
     mid = model_id or getattr(model.config, "_name_or_path", "unknown")
@@ -109,11 +126,13 @@ def offline_prefill_segment(
     target = store or get_global_offline_cache()
     target.put(seg)
     logger.info(
-        "RedKnot offline prefill: model=%s, len=%d, layers=%d, id=%s",
+        "RedKnot offline prefill: model=%s, len=%d, layers=%d, id=%s, "
+        "chunk_size=%d (single-forward capture)",
         mid,
         doc_len,
         n_layers,
         sid[:12],
+        chunk_size,
     )
     return seg
 

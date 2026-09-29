@@ -319,10 +319,11 @@ def _headclass_online_attention(
     - **local head**: ``[sink | online_prev | self]`` but every query
       position only sees the last ``window`` tokens of the global sequence
       plus the ``sink`` tokens (sliding-window attention, design.tex
-      eq:attn-local). Implemented via an additive banded mask.
+      eq:attn-local). Implemented as one causal FlashAttention call over
+      the concatenated ``[sink | recent]`` stream.
 
-    Both classes are evaluated as two batched GQA SDPA calls (no per-head
-    Python loop, no varlen kernel). Returns ``[1, Hq, Lb, D]``.
+    Both classes use native GQA FlashAttention (no per-head Python loop, no
+    varlen kernel, no LSE merge). Returns ``[1, Hq, Lb, D]``.
     """
     Hq = q.shape[1]
     Hkv = k_self.shape[1]
@@ -359,12 +360,10 @@ def _headclass_online_attention(
         g_out, _ = _flash_attn_lse(q[:, qh], kg, vg, sm_scale, causal=True, window=-1)
         out[:, qh] = g_out
 
-    # ── LOCAL heads: sink + sliding window, mask-free FlashAttention ──
-    # Visible KV for query position p is sink ∪ [p-W+1, p]. Two mask-free
-    # FlashAttention passes (native sliding-window + LSE), merged by LSE:
-    #   (1) recent : flash_attn(causal, window=(W-1,0)) over the trimmed
-    #                last (W+Lb) tokens of [online_prev | self].
-    #   (2) sink   : flash_attn(non-causal) over the first ``sink`` tokens.
+    # ── LOCAL heads: sink + sliding window, single causal FlashAttention ──
+    # Single-pass concat: [sink | recent] in one causal call, avoiding LSE
+    # merge. The NPU flash_attn shim returns lse=zeros, which made the old
+    # sigmoid(lse_a - lse_b) blend a fixed 50/50 weight.
     # GQA is native (K/V keep Hkv heads). No attn_mask is ever built.
     if local_kv.numel() > 0:
         s = max(0, min(sink_size, L0))
@@ -383,17 +382,22 @@ def _headclass_online_attention(
         rec_k = rec_k[:, :, -keep:, :]
         rec_v = rec_v[:, :, -keep:, :]
 
-        rec_out, rec_lse = _flash_attn_lse(
-            q_l, rec_k, rec_v, sm_scale, causal=True, window=window
-        )
         if s > 0:
             sink_k = seg0_k[:, local_kv, :s, :]
             sink_v = seg0_v[:, local_kv, :s, :]
-            sink_out, sink_lse = _flash_attn_lse(
-                q_l, sink_k, sink_v, sm_scale, causal=False, window=-1
+            # Single-pass concat path: [sink | recent] in one causal call.
+            # Avoids the LSE merge entirely (NPU shim cannot provide real LSE).
+            join_k = torch.cat([sink_k, rec_k], dim=2)
+            join_v = torch.cat([sink_v, rec_v], dim=2)
+            join_window = window + s
+            join_out, _ = _flash_attn_lse(
+                q_l, join_k, join_v, sm_scale, causal=True, window=join_window
             )
-            out[:, qh] = _merge_lse(rec_out, rec_lse, sink_out, sink_lse)
+            out[:, qh] = join_out
         else:
+            rec_out, _ = _flash_attn_lse(
+                q_l, rec_k, rec_v, sm_scale, causal=True, window=window
+            )
             out[:, qh] = rec_out
 
     return out
@@ -453,6 +457,10 @@ def _merge_lse(
     lse_b: torch.Tensor,
 ) -> torch.Tensor:
     """Combine two partial softmax attentions via their log-sum-exps.
+
+    The NPU local-head path no longer calls this: ``flash_attn_func`` there
+    returns an all-zero LSE, so the blend weight collapses to 0.5. Kept for
+    the original CUDA two-pass reference.
 
     The blend weight ``wa = sigmoid(lse_a - lse_b)`` is computed in fp32 but
     is only a per-(head, query) scalar broadcast over the head dim, so the
@@ -1201,12 +1209,14 @@ def _flat_headclass_attention(
 
     - global heads: causal over the full ``[seg0 | online]`` (query token i
       sees keys ``[0, L0 + i]``).
-    - local heads: sink ∪ sliding window of the last ``window`` tokens.
+    - local heads: sink ∪ sliding window of the last ``window`` tokens,
+      evaluated as one causal call over the concatenated ``[sink | recent]``
+      stream. The NPU flash-attention shim returns an all-zero LSE, so the
+      previous two-pass merge is not used.
 
-    Two mask-free FlashAttention passes per class (native GQA + native
-    window), merged by LSE. No attn_mask is ever built; no per-segment
-    Python loop. This is the architectural collapse of the per-slot online
-    attention into a single varlen-free call per layer.
+    No attn_mask is ever built; no per-segment Python loop. This is the
+    architectural collapse of the per-slot online attention into a single
+    varlen-free call per layer.
     """
     Hq = q.shape[1]
     T = q.shape[2]
@@ -1254,17 +1264,22 @@ def _flat_headclass_attention(
         keep = min(rec_k.shape[2], window + T)
         rec_k = rec_k[:, :, -keep:, :]
         rec_v = rec_v[:, :, -keep:, :]
-        rec_out, rec_lse = _flash_attn_lse(
-            q_l, rec_k, rec_v, sm_scale, causal=True, window=window
-        )
         if s > 0:
             sink_k = seg0_k[:, local_kv, :s, :]
             sink_v = seg0_v[:, local_kv, :s, :]
-            sink_out, sink_lse = _flash_attn_lse(
-                q_l, sink_k, sink_v, sm_scale, causal=False, window=-1
+            # Single-pass concat path: [sink | recent] in one causal call.
+            # Avoids the LSE merge entirely (NPU shim cannot provide real LSE).
+            join_k = torch.cat([sink_k, rec_k], dim=2)
+            join_v = torch.cat([sink_v, rec_v], dim=2)
+            join_window = window + s
+            join_out, _ = _flash_attn_lse(
+                q_l, join_k, join_v, sm_scale, causal=True, window=join_window
             )
-            out[:, qh] = _merge_lse(rec_out, rec_lse, sink_out, sink_lse)
+            out[:, qh] = join_out
         else:
+            rec_out, _ = _flash_attn_lse(
+                q_l, rec_k, rec_v, sm_scale, causal=True, window=window
+            )
             out[:, qh] = rec_out
 
     return out
@@ -1288,6 +1303,62 @@ def _get_compiled_block(fn, key, enable: bool):
     return cached
 
 
+def _token_attention_mass(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    sm_scale: float,
+    *,
+    sample_queries: int = 256,
+) -> torch.Tensor:
+    """Per-key attention mass averaged over query heads.
+
+    Uses sampled query rows (fp32 softmax) to estimate the algorithm's
+    SelectImportantTokens signal without materializing the full QK matrix.
+    """
+    batch, n_q_heads, q_len, _ = q.shape
+    k_len = k.shape[2]
+    num_q_per_kv = max(1, n_q_heads // max(1, k.shape[1]))
+    n = min(sample_queries, q_len)
+    idx = torch.randperm(q_len, device=q.device)[:n].sort().values
+    qs = q.index_select(2, idx).float()
+    ks = k.float()
+    k_expanded = ks.repeat_interleave(num_q_per_kv, dim=1)
+    scores = torch.matmul(qs, k_expanded.transpose(-1, -2)) * sm_scale
+    neg = torch.finfo(scores.dtype).min
+    pos_q = idx + max(0, k_len - q_len)
+    pos_k = torch.arange(k_len, device=q.device)
+    invalid = pos_k[None, :] > pos_q[:, None]
+    for slot in range(batch):
+        scores[slot].masked_fill_(invalid[None, :], neg)
+    probs = torch.softmax(scores, dim=-1)
+    return probs.mean(dim=(1, 2))
+
+
+def _capture_sparse_ffn_importance(
+    attn_out: torch.Tensor,
+    q: Optional[torch.Tensor],
+    k: Optional[torch.Tensor],
+    sm_scale: float,
+    schedule: Optional[object],
+) -> Optional[torch.Tensor]:
+    """Capture Sparse-FFN importance from the configured signal source."""
+    if schedule is None:
+        return None
+    signal = os.environ.get("REDKNOT_SPARSE_FFN_SIGNAL", "output_norm").lower()
+    if signal in ("attention_mass", "attn_mass", "mass"):
+        if q is None or k is None:
+            return token_importance_from_attn(attn_out).detach()
+        n_samples = int(os.environ.get("REDKNOT_SPARSE_FFN_MASS_QSAMPLE", "256"))
+        return _token_attention_mass(
+            q, k, sm_scale, sample_queries=n_samples
+        ).detach()
+    if signal in ("fixed_random", "random", "uniform"):
+        return torch.rand(
+            attn_out.shape[0], attn_out.shape[2], device=attn_out.device
+        )
+    return token_importance_from_attn(attn_out).detach()
+
+
 @torch.no_grad()
 def _run_flat_custom(
     base_model,
@@ -1309,13 +1380,23 @@ def _run_flat_custom(
     + post_norm) -> sparse MLP + residual. Final norm / lm_head are skipped
     (online prefill only needs the per-layer KV).
     """
-    device = flat_ids.device
     layers = base_model.layers
     n_layers = len(layers)
 
-    # Embedding + rotary (computed once).
+    # Embedding + rotary (computed once). Multi-device ``device_map="auto"``
+    # can leave ids, embeddings, and the first decoder layer on different
+    # devices; align them before the per-layer loop.
+    embed_device = next(base_model.embed_tokens.parameters()).device
+    if flat_ids.device != embed_device:
+        flat_ids = flat_ids.to(embed_device)
+    if flat_pos.device != embed_device:
+        flat_pos = flat_pos.to(embed_device)
     h = base_model.embed_tokens(flat_ids)
     cos, sin = base_model.rotary_emb(h, flat_pos)
+    first_layer_device = next(layers[0].parameters()).device
+    if cos.device != first_layer_device:
+        cos = cos.to(first_layer_device)
+        sin = sin.to(first_layer_device)
 
     for li in range(n_layers):
         layer = layers[li]
@@ -1326,6 +1407,9 @@ def _run_flat_custom(
 
         # ── pre-block: input_norm -> q/k/v proj -> q/k norm -> RoPE ──
         def pre_block(hs, cos, sin, _attn=attn, _layer=layer, _hd=head_dim):
+            if cos.device != hs.device:
+                cos = cos.to(hs.device)
+                sin = sin.to(hs.device)
             x = _layer.input_layernorm(hs)
             ishape = x.shape[:-1]
             hshape = (*ishape, -1, _hd)
@@ -1358,10 +1442,8 @@ def _run_flat_custom(
             num_q_per_kv=num_kv_groups,
             sm_scale=attn.scaling,
         )
-        importance = (
-            token_importance_from_attn(attn_out).detach()
-            if sparse_ffn_schedule is not None
-            else None
+        importance = _capture_sparse_ffn_importance(
+            attn_out, q, k, attn.scaling, sparse_ffn_schedule
         )
 
         # ── post-attention: o_proj + residual ──
